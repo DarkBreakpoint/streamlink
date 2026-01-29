@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.IO.Pipelines;
 using System.Linq;
 using System.Net.Http;
 using System.Threading;
@@ -38,15 +40,12 @@ public class HlsStreamWorker
     {
         try
         {
-            // Initial reload
             await ReloadPlaylistAsync(ct);
 
-            // Determine start sequence
             if (_sequence < 0)
             {
                 if (!_playlistEnd && !_session.Options.LiveRestart)
                 {
-                    // Live edge
                     double edge = _session.Options.LiveEdge;
                     if (_session.Options.KickLowLatency)
                     {
@@ -84,7 +83,7 @@ public class HlsStreamWorker
 
                 if (_playlistEnd && (!queued || _sequence > _playlistSegments.Last().Num))
                 {
-                    return; // End of stream
+                    return;
                 }
 
                 await WaitAndReloadAsync(ct);
@@ -105,15 +104,14 @@ public class HlsStreamWorker
     {
         _reloadLast = DateTimeOffset.UtcNow;
 
-        // Retry logic
         int attempts = Math.Max(1, _session.Options.PlaylistReloadAttempts);
-        string content = "";
+        Stream? stream = null;
 
         for (int i = 0; i < attempts; i++)
         {
              try
              {
-                  content = await _session.HttpClient.GetStringAsync(_url, ct);
+                  stream = await _session.HttpClient.GetStreamAsync(_url, ct);
                   break;
              }
              catch (Exception ex)
@@ -124,32 +122,38 @@ public class HlsStreamWorker
              }
         }
 
-        var m3u8 = await _parser.ParseAsync(new System.IO.Pipelines.PipeReader.Create(new System.IO.MemoryStream(System.Text.Encoding.UTF8.GetBytes(content))));
-        // Note: Using PipeReader created from memory stream for compatibility with refactored parser.
-        // Optimally we would stream directly from HttpClient stream into pipe, but HttpClient.GetStringAsync reads all.
-        // Ideally ReloadPlaylistAsync should use GetStreamAsync.
-        // For now this bridges the gap.
+        if (stream == null) throw new StreamError("Failed to fetch playlist stream.");
 
-        if (m3u8.IsMaster)
+        try
         {
-            throw new StreamError("Attempted to play a variant playlist. Use the variant URL instead.");
+            // Use PipeReader for async parsing without large string alloc
+            var pipeReader = PipeReader.Create(stream);
+            var m3u8 = await _parser.ParseAsync(pipeReader);
+
+            if (m3u8.IsMaster)
+            {
+                throw new StreamError("Attempted to play a variant playlist. Use the variant URL instead.");
+            }
+
+            _targetDuration = m3u8.TargetDuration ?? 0;
+
+            if (m3u8.Segments.Count > 0)
+            {
+                ProcessSegments(m3u8);
+            }
+
+            if (m3u8.IsEndList)
+            {
+                _playlistEnd = true;
+            }
+
+            if (_targetDuration > 0) _reloadTime = _targetDuration;
+            else _reloadTime = _session.Options.PlaylistReloadTime;
         }
-
-        _targetDuration = m3u8.TargetDuration ?? 0;
-
-        // Process segments
-        if (m3u8.Segments.Count > 0)
+        finally
         {
-            ProcessSegments(m3u8);
+            await stream.DisposeAsync();
         }
-
-        if (m3u8.IsEndList)
-        {
-            _playlistEnd = true;
-        }
-
-        if (_targetDuration > 0) _reloadTime = _targetDuration;
-        else _reloadTime = _session.Options.PlaylistReloadTime;
     }
 
     private void ProcessSegments(M3U8 m3u8)
