@@ -19,4 +19,19 @@ public static partial class Log
 
     [LoggerMessage(EventId = 5, Level = LogLevel.Error, Message = "Worker failed: {Message}")]
     public static partial void WorkerFailed(this ILogger logger, string message);
+
+    [LoggerMessage(EventId = 6, Level = LogLevel.Information, Message = "Playlist loaded. TargetDuration: {TargetDuration}s, Sequence: {Sequence}, Segments: {Count}, EndList: {IsEndList}")]
+    public static partial void PlaylistLoaded(this ILogger logger, double targetDuration, int sequence, int count, bool isEndList);
+
+    [LoggerMessage(EventId = 7, Level = LogLevel.Debug, Message = "Segment {Num} downloaded ({Size} bytes) in {Duration}ms")]
+    public static partial void SegmentDownloaded(this ILogger logger, int num, long size, double duration);
+
+    [LoggerMessage(EventId = 8, Level = LogLevel.Warning, Message = "Stream stall detected after {Timeout}s")]
+    public static partial void StreamStallDetected(this ILogger logger, double timeout);
+
+    [LoggerMessage(EventId = 9, Level = LogLevel.Debug, Message = "New subscriber connected to broadcaster. Active: {ActiveCount}")]
+    public static partial void BroadcasterSubscribed(this ILogger logger, int activeCount);
+
+    [LoggerMessage(EventId = 10, Level = LogLevel.Debug, Message = "Subscriber disconnected from broadcaster. Active: {ActiveCount}")]
+    public static partial void BroadcasterUnsubscribed(this ILogger logger, int activeCount);
 }

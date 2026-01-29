@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Pipelines;
 using System.Linq;
@@ -103,6 +104,7 @@ public class HlsStreamWorker
     private async Task ReloadPlaylistAsync(CancellationToken ct)
     {
         _reloadLast = DateTimeOffset.UtcNow;
+        var sw = Stopwatch.StartNew();
 
         int attempts = Math.Max(1, _session.Options.PlaylistReloadAttempts);
         Stream? stream = null;
@@ -126,7 +128,6 @@ public class HlsStreamWorker
 
         try
         {
-            // Use PipeReader for async parsing without large string alloc
             var pipeReader = PipeReader.Create(stream);
             var m3u8 = await _parser.ParseAsync(pipeReader);
 
@@ -149,6 +150,11 @@ public class HlsStreamWorker
 
             if (_targetDuration > 0) _reloadTime = _targetDuration;
             else _reloadTime = _session.Options.PlaylistReloadTime;
+
+            sw.Stop();
+            HlsMetrics.PlaylistRefreshes.Add(1);
+            HlsMetrics.PlaylistRefreshDuration.Record(sw.Elapsed.TotalMilliseconds);
+            _logger.PlaylistLoaded(_targetDuration, _sequence, m3u8.Segments.Count, m3u8.IsEndList);
         }
         finally
         {

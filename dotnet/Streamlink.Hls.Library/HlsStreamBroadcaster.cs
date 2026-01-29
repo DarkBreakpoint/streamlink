@@ -5,6 +5,8 @@ using System.IO;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Streamlink.Hls.Library;
 
@@ -14,17 +16,19 @@ public class HlsStreamBroadcaster : IDisposable
     private readonly int _bufferCapacity;
     private bool _completed;
     private Exception? _error;
+    private readonly ILogger<HlsStreamBroadcaster> _logger;
 
-    public HlsStreamBroadcaster(int bufferCapacity = 100)
+    public HlsStreamBroadcaster(int bufferCapacity = 100, ILogger<HlsStreamBroadcaster>? logger = null)
     {
         _bufferCapacity = bufferCapacity;
+        _logger = logger ?? NullLogger<HlsStreamBroadcaster>.Instance;
     }
 
     public Stream Subscribe(CancellationToken ct)
     {
         var options = new BoundedChannelOptions(_bufferCapacity)
         {
-            FullMode = BoundedChannelFullMode.DropOldest, // Ring buffer behavior: drop old for slow readers
+            FullMode = BoundedChannelFullMode.DropOldest,
             SingleReader = true,
             SingleWriter = true
         };
@@ -33,8 +37,9 @@ public class HlsStreamBroadcaster : IDisposable
         var id = Guid.NewGuid();
 
         _subscribers.TryAdd(id, channel);
+        HlsMetrics.ActiveSubscribers.Add(1);
+        _logger.BroadcasterSubscribed(_subscribers.Count);
 
-        // Return a Stream wrapper
         return new ChannelStream(channel.Reader, () => Unsubscribe(id));
     }
 
@@ -43,6 +48,8 @@ public class HlsStreamBroadcaster : IDisposable
         if (_subscribers.TryRemove(id, out var channel))
         {
             channel.Writer.TryComplete();
+            HlsMetrics.ActiveSubscribers.Add(-1);
+            _logger.BroadcasterUnsubscribed(_subscribers.Count);
         }
     }
 
@@ -52,9 +59,6 @@ public class HlsStreamBroadcaster : IDisposable
 
         foreach (var sub in _subscribers)
         {
-            // DropOldest handles the "ring buffer" overwriting logic automatically
-            // If the reader is slow, this TryWrite (or WriteAsync) will drop the oldest item if full.
-            // Note: WriteAsync with DropOldest completes synchronously usually.
             await sub.Value.Writer.WriteAsync(data, ct);
         }
     }
@@ -97,9 +101,6 @@ public class HlsStreamBroadcaster : IDisposable
 
         public override int Read(byte[] buffer, int offset, int count)
         {
-            // Sync-over-async avoidance: This is a legacy path.
-            // Ideally callers use ReadAsync.
-            // We'll implement a blocking read but it's not ideal.
             return ReadAsync(buffer, offset, count).AsTask().GetAwaiter().GetResult();
         }
 
@@ -118,7 +119,7 @@ public class HlsStreamBroadcaster : IDisposable
                 {
                     if (!await _reader.WaitToReadAsync(cancellationToken))
                     {
-                        return totalRead; // End of stream
+                        return totalRead;
                     }
 
                     if (!_reader.TryRead(out _currentBlock))
@@ -140,9 +141,6 @@ public class HlsStreamBroadcaster : IDisposable
                 if (_currentOffset >= _currentBlock.Length)
                 {
                     _currentBlock = default;
-                    // If we read something, return immediately to allow streaming,
-                    // or keep reading if we want to fill buffer?
-                    // Typically ReadAsync returns whatever is available.
                     return totalRead;
                 }
             }
