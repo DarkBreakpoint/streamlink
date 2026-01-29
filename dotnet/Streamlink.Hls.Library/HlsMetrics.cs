@@ -16,4 +16,6 @@ public static class HlsMetrics
 
     public static readonly UpDownCounter<int> ActiveSubscribers = Meter.CreateUpDownCounter<int>("hls.active_subscribers", "1", "Number of active stream readers");
     public static readonly Counter<long> StallEvents = Meter.CreateCounter<long>("hls.stall_events", "1", "Count of stream stall events detected");
+
+    public static readonly Counter<long> SubscriberDroppedChunks = Meter.CreateCounter<long>("hls.subscriber_dropped_chunks", "1", "Number of chunks dropped due to slow readers");
 }

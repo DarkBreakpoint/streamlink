@@ -59,6 +59,11 @@ public class HlsStreamBroadcaster : IDisposable
 
         foreach (var sub in _subscribers)
         {
+            // Heuristic to detect drops: if full, DropOldest will happen on Write.
+            if (sub.Value.Reader.Count >= _bufferCapacity)
+            {
+                HlsMetrics.SubscriberDroppedChunks.Add(1);
+            }
             await sub.Value.Writer.WriteAsync(data, ct);
         }
     }
