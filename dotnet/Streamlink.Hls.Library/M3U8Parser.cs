@@ -33,14 +33,14 @@ public class M3U8Parser
         _m3u8 = new M3U8(baseUri);
     }
 
+    [Obsolete("Use ParseAsync(PipeReader) instead.")]
     public M3U8 Parse(string data)
     {
         var bytes = Encoding.UTF8.GetBytes(data);
         var pipe = new Pipe();
         pipe.Writer.Write(bytes);
         pipe.Writer.Complete();
-        ParseAsync(pipe.Reader).GetAwaiter().GetResult();
-        return _m3u8;
+        return ParseAsync(pipe.Reader).GetAwaiter().GetResult();
     }
 
     public async Task<M3U8> ParseAsync(PipeReader reader)
