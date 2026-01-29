@@ -29,7 +29,10 @@ public class HlsStreamWriter
     public async Task RunAsync(CancellationToken cancellationToken)
     {
         // Channel to preserve order of segments/maps to be written
-        var orderChannel = Channel.CreateBounded<Task<Stream?>>(new BoundedChannelOptions(50)
+        // Use StreamSegmentThreads to control parallelism (capacity)
+        int threads = Math.Max(1, _session.Options.StreamSegmentThreads);
+
+        var orderChannel = Channel.CreateBounded<Task<Stream?>>(new BoundedChannelOptions(threads)
         {
             FullMode = BoundedChannelFullMode.Wait,
             SingleReader = true,
@@ -102,34 +105,66 @@ public class HlsStreamWriter
 
     private async Task<Stream?> DownloadMapAsync(Map map, HlsSegment context, CancellationToken ct)
     {
-        try
+        return await RetryAsync(async (token) =>
         {
-             return await FetchAndDecryptAsync(map.Uri, map.Key, map.ByteRange, context.Num, ct);
-        }
-        catch (Exception ex)
-        {
-             Console.Error.WriteLine($"Failed to download map {map.Uri}: {ex.Message}");
-             return null;
-        }
+             return await FetchAndDecryptAsync(map.Uri, map.Key, map.ByteRange, context.Num, token);
+        }, ct, "Map download");
     }
 
     private async Task<Stream?> DownloadSegmentAsync(HlsSegment segment, CancellationToken ct)
     {
         if (ShouldFilter(segment)) return null;
 
-        try
+        return await RetryAsync(async (token) =>
         {
-            return await FetchAndDecryptAsync(segment.Uri, segment.Key, segment.ByteRange, segment.Num, ct);
-        }
-        catch (Exception ex)
+            return await FetchAndDecryptAsync(segment.Uri, segment.Key, segment.ByteRange, segment.Num, token);
+        }, ct, $"Segment {segment.Num}");
+    }
+
+    private async Task<T?> RetryAsync<T>(Func<CancellationToken, Task<T>> func, CancellationToken ct, string context)
+    {
+        int attempts = Math.Max(1, _session.Options.StreamSegmentAttempts);
+        for (int i = 0; i < attempts; i++)
         {
-            Console.Error.WriteLine($"Failed to download segment {segment.Num} ({segment.Uri}): {ex.Message}");
-            return null;
+            try
+            {
+                // Create a timeout token for the attempt
+                using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(_session.Options.StreamSegmentTimeout));
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+
+                return await func(linkedCts.Token);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                if (i == attempts - 1)
+                {
+                    Console.Error.WriteLine($"Failed {context} after {attempts} attempts: {ex.Message}");
+                    return default;
+                }
+                // Backoff?
+                await Task.Delay(1000, ct); // Simple delay
+            }
         }
+        return default;
     }
 
     private bool ShouldFilter(HlsSegment segment)
     {
+        // ignore names
+        if (_session.Options.SegmentIgnoreNames.Count > 0)
+        {
+             // Simple contains check or regex?
+             // Python implementation uses regex.
+             // Here we have list of strings. Assuming simple substring or use Regex if passed as such.
+             foreach (var ignore in _session.Options.SegmentIgnoreNames)
+             {
+                 if (segment.Uri.Contains(ignore)) return true;
+             }
+        }
         return false;
     }
 
@@ -142,9 +177,19 @@ public class HlsStreamWriter
         if (key != null && key.Method != "NONE")
         {
              if (key.Method != "AES-128") throw new StreamError($"Unsupported encryption method: {key.Method}");
-             if (string.IsNullOrEmpty(key.Uri)) throw new StreamError("Missing Key URI");
 
-             keyData = await GetKeyAsync(key.Uri, ct);
+             string keyUri = key.Uri ?? "";
+             if (!string.IsNullOrEmpty(_session.Options.SegmentKeyUriOverride))
+             {
+                 // Should format override with keyUri parts?
+                 // Simple override for now as per minimal requirement, or implementing full formatter?
+                 // Python does formatting.
+                 keyUri = _session.Options.SegmentKeyUriOverride;
+             }
+
+             if (string.IsNullOrEmpty(keyUri)) throw new StreamError("Missing Key URI");
+
+             keyData = await GetKeyAsync(keyUri, ct);
 
              if (key.Iv != null) iv = key.Iv;
              else iv = AesUtil.CreateIv(sequenceNum);

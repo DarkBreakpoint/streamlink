@@ -21,33 +21,102 @@ class Program
         for (int i = 0; i < args.Length; i++)
         {
             var arg = args[i];
+
+            // Value helper
+            bool HasVal(out string val)
+            {
+                if (i + 1 < args.Length)
+                {
+                    val = args[++i];
+                    return true;
+                }
+                val = "";
+                return false;
+            }
+
             if (arg == "-o" || arg == "--output")
             {
-                if (i + 1 < args.Length) outputPath = args[++i];
+                if (HasVal(out var v)) outputPath = v;
             }
-            else if (arg == "--live-edge")
+            else if (arg == "--hls-live-edge")
             {
-                if (i + 1 < args.Length && double.TryParse(args[++i], out var v)) options.LiveEdge = v;
+                if (HasVal(out var v) && double.TryParse(v, out var d)) options.LiveEdge = d;
             }
-            else if (arg == "--start-offset")
+            else if (arg == "--hls-start-offset")
             {
-                if (i + 1 < args.Length && double.TryParse(args[++i], out var v)) options.StartOffset = v;
+                if (HasVal(out var v) && double.TryParse(v, out var d)) options.StartOffset = d;
             }
-            else if (arg == "--duration")
+            else if (arg == "--hls-duration")
             {
-                if (i + 1 < args.Length && double.TryParse(args[++i], out var v)) options.Duration = v;
+                if (HasVal(out var v) && double.TryParse(v, out var d)) options.Duration = d;
             }
-            else if (arg == "--retries")
+            else if (arg == "--stream-segment-attempts")
             {
-                if (i + 1 < args.Length && int.TryParse(args[++i], out var v)) options.Retries = v;
+                if (HasVal(out var v) && int.TryParse(v, out var d)) options.StreamSegmentAttempts = d;
             }
-            else if (arg == "--timeout")
+            else if (arg == "--stream-segment-threads")
             {
-                if (i + 1 < args.Length && int.TryParse(args[++i], out var v)) options.StreamTimeout = v;
+                if (HasVal(out var v) && int.TryParse(v, out var d)) options.StreamSegmentThreads = d;
             }
-            else if (arg == "--live-restart")
+            else if (arg == "--stream-segment-timeout")
+            {
+                if (HasVal(out var v) && double.TryParse(v, out var d)) options.StreamSegmentTimeout = d;
+            }
+            else if (arg == "--stream-timeout")
+            {
+                if (HasVal(out var v) && double.TryParse(v, out var d)) options.StreamTimeout = d;
+            }
+            else if (arg == "--stream-segmented-duration")
+            {
+                if (HasVal(out var v) && double.TryParse(v, out var d)) options.StreamSegmentedDuration = d;
+            }
+            else if (arg == "--stream-segmented-queue-deadline")
+            {
+                if (HasVal(out var v) && double.TryParse(v, out var d)) options.StreamSegmentedQueueDeadline = d;
+            }
+            else if (arg == "--hls-segment-queue-threshold")
+            {
+                if (HasVal(out var v) && double.TryParse(v, out var d)) options.HlsSegmentQueueThreshold = d;
+            }
+            else if (arg == "--hls-playlist-reload-attempts")
+            {
+                if (HasVal(out var v) && int.TryParse(v, out var d)) options.PlaylistReloadAttempts = d;
+            }
+            else if (arg == "--hls-segment-key-uri")
+            {
+                if (HasVal(out var v)) options.SegmentKeyUriOverride = v;
+            }
+            else if (arg == "--hls-segment-ignore-names")
+            {
+                if (HasVal(out var v)) options.SegmentIgnoreNames.Add(v);
+            }
+            else if (arg == "--hls-audio-select")
+            {
+                if (HasVal(out var v)) options.HlsAudioSelect.Add(v);
+            }
+            else if (arg == "--hls-live-restart")
             {
                 options.LiveRestart = true;
+            }
+            else if (arg == "--kick-low-latency")
+            {
+                options.KickLowLatency = true;
+            }
+            else if (arg == "--hls-segment-stream-data")
+            {
+                options.SegmentStreamData = true;
+            }
+            else if (arg == "--live-edge") // Alias
+            {
+                if (HasVal(out var v) && double.TryParse(v, out var d)) options.LiveEdge = d;
+            }
+            else if (arg == "--start-offset") // Alias
+            {
+                if (HasVal(out var v) && double.TryParse(v, out var d)) options.StartOffset = d;
+            }
+            else if (arg == "--duration") // Alias
+            {
+                if (HasVal(out var v) && double.TryParse(v, out var d)) options.Duration = d;
             }
             else if (!arg.StartsWith("-"))
             {
@@ -58,6 +127,18 @@ class Program
         if (string.IsNullOrEmpty(url))
         {
             Console.WriteLine("Usage: Streamlink.Hls.Cli <url> [options]");
+            Console.WriteLine("Options:");
+            Console.WriteLine("  --output <path>                  Write stream to file");
+            Console.WriteLine("  --hls-live-edge <n>              Segments from live edge to start (default 3)");
+            Console.WriteLine("  --hls-start-offset <n>           Start offset in seconds");
+            Console.WriteLine("  --hls-duration <n>               Stop after n seconds");
+            Console.WriteLine("  --stream-segment-attempts <n>    Retries per segment (default 3)");
+            Console.WriteLine("  --stream-segment-threads <n>     Concurrent threads (default 1)");
+            Console.WriteLine("  --stream-segment-timeout <n>     Timeout per segment (default 10.0)");
+            Console.WriteLine("  --stream-timeout <n>             Connection timeout (default 60.0)");
+            Console.WriteLine("  --hls-playlist-reload-attempts <n>");
+            Console.WriteLine("  --hls-live-restart               Start from beginning of live stream");
+            Console.WriteLine("  --kick-low-latency               Reduce live edge for low latency");
             return 1;
         }
 
