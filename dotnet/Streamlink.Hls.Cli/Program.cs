@@ -66,6 +66,10 @@ class Program
             {
                 if (HasVal(out var v) && double.TryParse(v, out var d)) options.StreamTimeout = d;
             }
+            else if (arg == "--stream-stall-timeout")
+            {
+                if (HasVal(out var v) && double.TryParse(v, out var d)) options.StreamStallTimeout = d;
+            }
             else if (arg == "--stream-segmented-duration")
             {
                 if (HasVal(out var v) && double.TryParse(v, out var d)) options.StreamSegmentedDuration = d;
@@ -136,6 +140,7 @@ class Program
             Console.WriteLine("  --stream-segment-threads <n>     Concurrent threads (default 1)");
             Console.WriteLine("  --stream-segment-timeout <n>     Timeout per segment (default 10.0)");
             Console.WriteLine("  --stream-timeout <n>             Connection timeout (default 60.0)");
+            Console.WriteLine("  --stream-stall-timeout <n>       Data read stall timeout (default 5.0)");
             Console.WriteLine("  --hls-playlist-reload-attempts <n>");
             Console.WriteLine("  --hls-live-restart               Start from beginning of live stream");
             Console.WriteLine("  --kick-low-latency               Reduce live edge for low latency");

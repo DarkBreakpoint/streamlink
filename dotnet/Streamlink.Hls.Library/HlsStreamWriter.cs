@@ -228,7 +228,8 @@ public class HlsStreamWriter
 
         var networkStream = await response.Content.ReadAsStreamAsync(ct);
 
-        var stallStream = new StallDetectingStream(networkStream, TimeSpan.FromSeconds(5));
+        // Use configured StreamStallTimeout
+        var stallStream = new StallDetectingStream(networkStream, TimeSpan.FromSeconds(_session.Options.StreamStallTimeout));
 
         Stream resultStream = stallStream;
         if (keyData != null && iv != null)

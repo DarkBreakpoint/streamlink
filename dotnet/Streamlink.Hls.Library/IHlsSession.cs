@@ -27,6 +27,7 @@ public class HlsOptions
     public int StreamSegmentThreads { get; set; } = 1;
     public double StreamSegmentTimeout { get; set; } = 10.0;
     public double StreamTimeout { get; set; } = 60.0; // Connection timeout
+    public double StreamStallTimeout { get; set; } = 5.0; // Read stall timeout
 
     public double? StreamSegmentedDuration { get; set; }
     public double? StreamSegmentedQueueDeadline { get; set; }
