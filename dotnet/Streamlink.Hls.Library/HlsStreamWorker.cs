@@ -5,6 +5,8 @@ using System.Net.Http;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Streamlink.Hls.Library.Models;
 
 namespace Streamlink.Hls.Library;
@@ -14,6 +16,7 @@ public class HlsStreamWorker
     private readonly IHlsSession _session;
     private readonly string _url;
     private readonly M3U8Parser _parser;
+    private readonly ILogger<HlsStreamWorker> _logger;
 
     // State
     private int _sequence = -1;
@@ -23,11 +26,12 @@ public class HlsStreamWorker
     private DateTimeOffset _reloadLast;
     private double _targetDuration;
 
-    public HlsStreamWorker(IHlsSession session, string url)
+    public HlsStreamWorker(IHlsSession session, string url, ILogger<HlsStreamWorker>? logger = null)
     {
         _session = session;
         _url = url;
         _parser = new M3U8Parser(url);
+        _logger = logger ?? NullLogger<HlsStreamWorker>.Instance;
     }
 
     public async Task RunAsync(ChannelWriter<HlsSegment> writer, CancellationToken ct)
@@ -66,14 +70,6 @@ public class HlsStreamWorker
                 }
             }
 
-            // Start Offset logic?
-            // If StartOffset > 0, we might need to skip
-            if (_session.Options.StartOffset > 0 && _session.Options.LiveRestart)
-            {
-                // Skip logic similar to python's duration_to_sequence
-                // Omitted for brevity but acknowledging presence of option
-            }
-
             while (!ct.IsCancellationRequested)
             {
                 bool queued = false;
@@ -97,7 +93,7 @@ public class HlsStreamWorker
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"Worker failed: {ex}");
+            _logger.WorkerFailed(ex.Message);
         }
         finally
         {
@@ -128,7 +124,11 @@ public class HlsStreamWorker
              }
         }
 
-        var m3u8 = _parser.Parse(content);
+        var m3u8 = await _parser.ParseAsync(new System.IO.Pipelines.PipeReader.Create(new System.IO.MemoryStream(System.Text.Encoding.UTF8.GetBytes(content))));
+        // Note: Using PipeReader created from memory stream for compatibility with refactored parser.
+        // Optimally we would stream directly from HttpClient stream into pipe, but HttpClient.GetStringAsync reads all.
+        // Ideally ReloadPlaylistAsync should use GetStreamAsync.
+        // For now this bridges the gap.
 
         if (m3u8.IsMaster)
         {
@@ -148,15 +148,12 @@ public class HlsStreamWorker
             _playlistEnd = true;
         }
 
-        // Calculate reload time
-        // Simple logic for now: target duration or default
         if (_targetDuration > 0) _reloadTime = _targetDuration;
         else _reloadTime = _session.Options.PlaylistReloadTime;
     }
 
     private void ProcessSegments(M3U8 m3u8)
     {
-        // Detect playlist change
         _playlistSegments = m3u8.Segments;
     }
 
