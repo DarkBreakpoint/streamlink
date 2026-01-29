@@ -34,11 +34,16 @@ public class HlsStreamWriter
         _httpClient = session.HttpClient;
         _logger = logger ?? NullLogger<HlsStreamWriter>.Instance;
 
+        // Use RetryMax or StreamSegmentAttempts
+        int attempts = session.Options.RetryMax > 0 ? session.Options.RetryMax : session.Options.StreamSegmentAttempts;
+        // Use RetryStreams (delay)
+        double delay = session.Options.RetryStreams > 0 ? session.Options.RetryStreams : 1.0;
+
         _resiliencePipeline = new ResiliencePipelineBuilder()
             .AddRetry(new RetryStrategyOptions
             {
-                MaxRetryAttempts = Math.Max(1, session.Options.StreamSegmentAttempts),
-                Delay = TimeSpan.FromSeconds(1),
+                MaxRetryAttempts = Math.Max(1, attempts),
+                Delay = TimeSpan.FromSeconds(delay),
                 BackoffType = DelayBackoffType.Exponential,
                 UseJitter = true,
                 ShouldHandle = new PredicateBuilder().Handle<Exception>()
@@ -122,22 +127,10 @@ public class HlsStreamWriter
                             await _outputBroadcaster.WriteAsync(new ReadOnlyMemory<byte>(buffer.AsSpan(0, read).ToArray()), ct);
                         }
                     }
-                    catch (IOException ex) when (ex.Message.Contains("stall")) // Stall Detection exception
+                    catch (IOException ex) when (ex.Message.Contains("stall"))
                     {
                         HlsMetrics.StallEvents.Add(1);
                         _logger.StreamStallDetected(_session.Options.StreamStallTimeout);
-                        // Continue to next segment or fail?
-                        // If segment fails mid-read, it's corrupt. We should probably fail the segment logic,
-                        // but here we are consuming the stream produced by DownloadSegmentAsync.
-                        // Ideally the retry logic in DownloadSegmentAsync handles it, but Consume happens after retries.
-                        // Actually, DownloadSegmentAsync returns a Stream. The retry logic wrapped the *creation* of the stream.
-                        // If the stream *fails during read*, Polly logic inside `FetchAndDecryptAsync` (if any) or `DownloadSegmentAsync` (if creating stream fails) applies.
-                        // But `StallDetectingStream` wraps the network stream. The read failure happens here.
-                        // We can't retry "reading" easily without re-downloading.
-                        // So a read failure here is likely terminal for this segment unless we redesign to consume *inside* the retry block.
-                        // Current architecture: Producer creates Stream. Consumer reads Stream.
-                        // If Consumer fails reading, we lose that data.
-                        // We will log it.
                         Console.Error.WriteLine($"Segment read stalled: {ex.Message}");
                     }
                 }
@@ -183,7 +176,7 @@ public class HlsStreamWriter
 
             sw.Stop();
             HlsMetrics.SegmentDownloadDuration.Record(sw.Elapsed.TotalMilliseconds);
-            _logger.SegmentDownloaded(segment.Num, -1, sw.Elapsed.TotalMilliseconds); // Size unknown here without reading content length header explicitly again or refactoring
+            _logger.SegmentDownloaded(segment.Num, -1, sw.Elapsed.TotalMilliseconds);
             return result;
         }
         catch (Exception ex)

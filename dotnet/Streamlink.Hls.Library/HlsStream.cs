@@ -45,7 +45,6 @@ public class HlsStream : IDisposable
             }
         }
 
-        // Subscribe to broadcaster
         return _broadcaster!.Subscribe(cancellationToken);
     }
 
@@ -60,7 +59,8 @@ public class HlsStream : IDisposable
             FullMode = BoundedChannelFullMode.Wait
         });
 
-        _broadcaster = new HlsStreamBroadcaster();
+        // Use RingBufferSize from options
+        _broadcaster = new HlsStreamBroadcaster(_session.Options.RingBufferSize, _loggerFactory.CreateLogger<HlsStreamBroadcaster>());
 
         _worker = new HlsStreamWorker(_session, _url, _loggerFactory.CreateLogger<HlsStreamWorker>());
         _writer = new HlsStreamWriter(_session, _segmentChannel, _broadcaster, _loggerFactory.CreateLogger<HlsStreamWriter>());

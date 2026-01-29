@@ -14,7 +14,7 @@ public class HlsOptions
     public double Duration { get; set; }
     public int PlaylistReloadAttempts { get; set; } = 3;
     public double PlaylistReloadTime { get; set; } = 6.0;
-    public double HlsSegmentQueueThreshold { get; set; } = 3.0; // Default factor?
+    public double HlsSegmentQueueThreshold { get; set; } = 3.0;
     public List<string> HlsAudioSelect { get; set; } = new();
 
     // Segment handling
@@ -26,15 +26,21 @@ public class HlsOptions
     public int StreamSegmentAttempts { get; set; } = 3;
     public int StreamSegmentThreads { get; set; } = 1;
     public double StreamSegmentTimeout { get; set; } = 10.0;
-    public double StreamTimeout { get; set; } = 60.0; // Connection timeout
-    public double StreamStallTimeout { get; set; } = 5.0; // Read stall timeout
+    public double StreamTimeout { get; set; } = 60.0;
+    public double StreamStallTimeout { get; set; } = 5.0;
 
     public double? StreamSegmentedDuration { get; set; }
     public double? StreamSegmentedQueueDeadline { get; set; }
 
-    public bool KickLowLatency { get; set; } // Reduce live edge for low latency?
+    public bool KickLowLatency { get; set; }
 
-    // FFMPEG (Future use)
+    // New Options
+    public int RingBufferSize { get; set; } = 100; // Default capacity
+    public double RetryStreams { get; set; } = 1.0; // Delay between retries in seconds
+    public int RetryMax { get; set; } = 3; // General retry cap
+    public int RetryOpen { get; set; } = 3; // Retries for opening stream (playlist fetch)
+
+    // FFMPEG
     public string? FfmpegFfmpeg { get; set; }
     public string? FfmpegVideoTranscode { get; set; } = "copy";
     public string? FfmpegAudioTranscode { get; set; } = "copy";
@@ -61,11 +67,10 @@ public class HlsSession : IHlsSession
         }
         else
         {
-            // Custom SocketsHttpHandler for HTTP/3 and tuning
             var handler = new SocketsHttpHandler
             {
-                ConnectTimeout = TimeSpan.FromSeconds(10), // Fast failover
-                PooledConnectionLifetime = TimeSpan.FromMinutes(2), // DNS refresh
+                ConnectTimeout = TimeSpan.FromSeconds(10),
+                PooledConnectionLifetime = TimeSpan.FromMinutes(2),
                 KeepAlivePingDelay = TimeSpan.FromSeconds(30),
                 KeepAlivePingTimeout = TimeSpan.FromSeconds(5)
             };
