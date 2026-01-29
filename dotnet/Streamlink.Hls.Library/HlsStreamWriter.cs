@@ -6,6 +6,10 @@ using System.Net.Http;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
+using System.Diagnostics;
+using Polly;
+using Polly.Retry;
+using Polly.Timeout;
 using Streamlink.Hls.Library.Models;
 
 namespace Streamlink.Hls.Library;
@@ -17,6 +21,7 @@ public class HlsStreamWriter
     private readonly StreamBuffer _outputBuffer;
     private readonly ConcurrentDictionary<string, Task<byte[]>> _keyCache = new();
     private readonly HttpClient _httpClient;
+    private readonly ResiliencePipeline _resiliencePipeline;
 
     public HlsStreamWriter(IHlsSession session, Channel<HlsSegment> inputChannel, StreamBuffer outputBuffer)
     {
@@ -24,31 +29,40 @@ public class HlsStreamWriter
         _inputChannel = inputChannel;
         _outputBuffer = outputBuffer;
         _httpClient = session.HttpClient;
+
+        // Build Resilience Pipeline
+        // Combines Retry and Timeout
+        _resiliencePipeline = new ResiliencePipelineBuilder()
+            .AddRetry(new RetryStrategyOptions
+            {
+                MaxRetryAttempts = Math.Max(1, session.Options.StreamSegmentAttempts),
+                Delay = TimeSpan.FromSeconds(1), // Initial delay
+                BackoffType = DelayBackoffType.Exponential,
+                UseJitter = true,
+                ShouldHandle = new PredicateBuilder().Handle<Exception>()
+            })
+            .AddTimeout(TimeSpan.FromSeconds(session.Options.StreamSegmentTimeout))
+            .Build();
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
     {
-        // Channel to preserve order of segments/maps to be written
-        // Use StreamSegmentThreads to control parallelism (capacity)
         int threads = Math.Max(1, _session.Options.StreamSegmentThreads);
 
-        var orderChannel = Channel.CreateBounded<Task<Stream?>>(new BoundedChannelOptions(threads)
+        var orderChannel = Channel.CreateBounded<ValueTask<Stream?>>(new BoundedChannelOptions(threads)
         {
             FullMode = BoundedChannelFullMode.Wait,
             SingleReader = true,
             SingleWriter = true
         });
 
-        // Start Producer (Downloader)
         var downloadTask = ProduceDownloadsAsync(orderChannel.Writer, cancellationToken);
-
-        // Start Consumer (Writer)
         var writeTask = ConsumeAndWriteAsync(orderChannel.Reader, cancellationToken);
 
         await Task.WhenAll(downloadTask, writeTask);
     }
 
-    private async Task ProduceDownloadsAsync(ChannelWriter<Task<Stream?>> writer, CancellationToken ct)
+    private async Task ProduceDownloadsAsync(ChannelWriter<ValueTask<Stream?>> writer, CancellationToken ct)
     {
         try
         {
@@ -76,12 +90,11 @@ public class HlsStreamWriter
         }
     }
 
-    private async Task ConsumeAndWriteAsync(ChannelReader<Task<Stream?>> reader, CancellationToken ct)
+    private async Task ConsumeAndWriteAsync(ChannelReader<ValueTask<Stream?>> reader, CancellationToken ct)
     {
         try
         {
-            // Get output stream wrapper for PipeWriter
-            using var outputStream = _outputBuffer.Writer.AsStream(true); // leaveOpen=true
+            using var outputStream = _outputBuffer.Writer.AsStream(true);
 
             await foreach (var task in reader.ReadAllAsync(ct))
             {
@@ -89,7 +102,7 @@ public class HlsStreamWriter
                 if (stream != null)
                 {
                     await stream.CopyToAsync(outputStream, ct);
-                    await _outputBuffer.Writer.FlushAsync(ct); // Ensure flushed
+                    await _outputBuffer.Writer.FlushAsync(ct);
                 }
             }
         }
@@ -103,63 +116,50 @@ public class HlsStreamWriter
         _outputBuffer.CompleteWriter();
     }
 
-    private async Task<Stream?> DownloadMapAsync(Map map, HlsSegment context, CancellationToken ct)
+    private async ValueTask<Stream?> DownloadMapAsync(Map map, HlsSegment context, CancellationToken ct)
     {
-        return await RetryAsync(async (token) =>
+        try
         {
-             return await FetchAndDecryptAsync(map.Uri, map.Key, map.ByteRange, context.Num, token);
-        }, ct, "Map download");
+            return await _resiliencePipeline.ExecuteAsync(async (token) =>
+            {
+                 return await FetchAndDecryptAsync(map.Uri, map.Key, map.ByteRange, context.Num, token);
+            }, ct);
+        }
+        catch (Exception ex)
+        {
+             Console.Error.WriteLine($"Failed to download map {map.Uri}: {ex.Message}");
+             return null;
+        }
     }
 
-    private async Task<Stream?> DownloadSegmentAsync(HlsSegment segment, CancellationToken ct)
+    private async ValueTask<Stream?> DownloadSegmentAsync(HlsSegment segment, CancellationToken ct)
     {
         if (ShouldFilter(segment)) return null;
 
-        return await RetryAsync(async (token) =>
+        var sw = Stopwatch.StartNew();
+        try
         {
-            return await FetchAndDecryptAsync(segment.Uri, segment.Key, segment.ByteRange, segment.Num, token);
-        }, ct, $"Segment {segment.Num}");
-    }
+            var result = await _resiliencePipeline.ExecuteAsync(async (token) =>
+            {
+                return await FetchAndDecryptAsync(segment.Uri, segment.Key, segment.ByteRange, segment.Num, token);
+            }, ct);
 
-    private async Task<T?> RetryAsync<T>(Func<CancellationToken, Task<T>> func, CancellationToken ct, string context)
-    {
-        int attempts = Math.Max(1, _session.Options.StreamSegmentAttempts);
-        for (int i = 0; i < attempts; i++)
-        {
-            try
-            {
-                // Create a timeout token for the attempt
-                using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(_session.Options.StreamSegmentTimeout));
-                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
-
-                return await func(linkedCts.Token);
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                if (i == attempts - 1)
-                {
-                    Console.Error.WriteLine($"Failed {context} after {attempts} attempts: {ex.Message}");
-                    return default;
-                }
-                // Backoff?
-                await Task.Delay(1000, ct); // Simple delay
-            }
+            sw.Stop();
+            HlsMetrics.SegmentDownloadDuration.Record(sw.Elapsed.TotalMilliseconds);
+            return result;
         }
-        return default;
+        catch
+        {
+            HlsMetrics.SegmentDownloadErrors.Add(1);
+            Console.Error.WriteLine($"Failed to download segment {segment.Num}: {segment.Uri}");
+            return null; // Return null on failure after retries exhausted
+        }
     }
 
     private bool ShouldFilter(HlsSegment segment)
     {
-        // ignore names
         if (_session.Options.SegmentIgnoreNames.Count > 0)
         {
-             // Simple contains check or regex?
-             // Python implementation uses regex.
-             // Here we have list of strings. Assuming simple substring or use Regex if passed as such.
              foreach (var ignore in _session.Options.SegmentIgnoreNames)
              {
                  if (segment.Uri.Contains(ignore)) return true;
@@ -168,9 +168,8 @@ public class HlsStreamWriter
         return false;
     }
 
-    private async Task<Stream> FetchAndDecryptAsync(string uri, Key? key, ByteRange? byteRange, int sequenceNum, CancellationToken ct)
+    private async ValueTask<Stream> FetchAndDecryptAsync(string uri, Key? key, ByteRange? byteRange, int sequenceNum, CancellationToken ct)
     {
-        // 1. Fetch Key if needed
         byte[]? keyData = null;
         byte[]? iv = null;
 
@@ -181,9 +180,6 @@ public class HlsStreamWriter
              string keyUri = key.Uri ?? "";
              if (!string.IsNullOrEmpty(_session.Options.SegmentKeyUriOverride))
              {
-                 // Should format override with keyUri parts?
-                 // Simple override for now as per minimal requirement, or implementing full formatter?
-                 // Python does formatting.
                  keyUri = _session.Options.SegmentKeyUriOverride;
              }
 
@@ -195,7 +191,6 @@ public class HlsStreamWriter
              else iv = AesUtil.CreateIv(sequenceNum);
         }
 
-        // 2. Fetch Data
         var req = new HttpRequestMessage(HttpMethod.Get, uri);
         if (byteRange.HasValue)
         {
@@ -209,9 +204,15 @@ public class HlsStreamWriter
 
         var response = await _httpClient.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
         response.EnsureSuccessStatusCode();
+
+        long? contentLength = response.Content.Headers.ContentLength;
+        if (contentLength.HasValue)
+        {
+            HlsMetrics.BytesDownloaded.Add(contentLength.Value);
+        }
+
         var networkStream = await response.Content.ReadAsStreamAsync(ct);
 
-        // 3. Decrypt
         if (keyData != null && iv != null)
         {
              return AesUtil.CreateDecryptingStream(networkStream, keyData, iv);

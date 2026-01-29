@@ -2,7 +2,11 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.IO.Pipelines;
 using System.Linq;
+using System.Text;
+using System.Buffers;
+using System.Threading.Tasks;
 using Streamlink.Hls.Library.Models;
 
 namespace Streamlink.Hls.Library;
@@ -31,45 +35,84 @@ public class M3U8Parser
 
     public M3U8 Parse(string data)
     {
-        using var reader = new StringReader(data);
-        return Parse(reader);
+        // Legacy entry point
+        var bytes = Encoding.UTF8.GetBytes(data);
+        var pipe = new Pipe();
+        pipe.Writer.Write(bytes);
+        pipe.Writer.Complete();
+        ParseAsync(pipe.Reader).GetAwaiter().GetResult(); // Sync over Async for legacy compat
+        return _m3u8;
     }
 
-    public M3U8 Parse(TextReader reader)
+    // New Pipelined Entry Point
+    public async Task<M3U8> ParseAsync(PipeReader reader)
     {
-        // Check header
-        string? line = reader.ReadLine();
-        if (line == null) return _m3u8;
-
-        if (!line.StartsWith("#EXTM3U"))
+        while (true)
         {
-            // Log warning?
-            throw new InvalidDataException("Missing #EXTM3U header");
-        }
+            ReadResult result = await reader.ReadAsync();
+            ReadOnlySequence<byte> buffer = result.Buffer;
 
-        while ((line = reader.ReadLine()) != null)
-        {
-            if (string.IsNullOrWhiteSpace(line)) continue;
+            while (TryReadLine(ref buffer, out ReadOnlySequence<byte> lineSequence))
+            {
+                 // Process Line
+                 // We need to decode to chars. UTF8.
+                 // For low alloc, we can use a stack buffer if line is small, or array pool.
+                 // Most M3U8 lines are short (< 1024 chars).
+                 if (lineSequence.Length > 4096)
+                 {
+                     // Fallback for huge lines? Or just alloc.
+                     ParseLineString(Encoding.UTF8.GetString(lineSequence));
+                 }
+                 else
+                 {
+                     int len = (int)lineSequence.Length;
+                     char[] chars = ArrayPool<char>.Shared.Rent(len); // Or use stackalloc with Span if not async? We are inside async method.
+                     try
+                     {
+                         int charCount = Encoding.UTF8.GetChars(lineSequence, chars);
+                         ParseLine(chars.AsSpan(0, charCount).Trim());
+                     }
+                     finally
+                     {
+                         ArrayPool<char>.Shared.Return(chars);
+                     }
+                 }
+            }
 
-            ParseLine(line.AsSpan().Trim());
+            reader.AdvanceTo(buffer.Start, buffer.End);
+
+            if (result.IsCompleted)
+            {
+                break;
+            }
         }
 
         FinalizeParse();
         return _m3u8;
     }
 
+    private static bool TryReadLine(ref ReadOnlySequence<byte> buffer, out ReadOnlySequence<byte> line)
+    {
+        SequencePosition? position = buffer.PositionOf((byte)'\n');
+
+        if (position == null)
+        {
+            line = default;
+            return false;
+        }
+
+        line = buffer.Slice(0, position.Value);
+        buffer = buffer.Slice(buffer.GetPosition(1, position.Value));
+        return true;
+    }
+
     private void FinalizeParse()
     {
         _m3u8.IsMaster = _m3u8.Playlists.Count > 0;
 
-        // Associate Media entries with each Playlist
         foreach (var playlist in _m3u8.Playlists)
         {
             var streamInfo = playlist.StreamInfo;
-            // Handle StreamInfo
-            // Python: group_id = getattr(playlist.stream_info, media_type, None)
-            // We need to check Audio, Video, Subtitles group IDs.
-
             if (streamInfo is StreamInfo si)
             {
                 if (si.Audio != null) AddMediaToPlaylist(playlist, si.Audio, "AUDIO");
@@ -82,17 +125,9 @@ public class M3U8Parser
             }
         }
 
-        // Update segment numbers
         int mediaSequence = _m3u8.MediaSequence ?? 0;
         for (int i = 0; i < _m3u8.Segments.Count; i++)
         {
-             // We can't easily modify the record since it is immutable...
-             // But wait, records have `with`. But I stored them in a list.
-             // I'll need to replace them or make Num mutable or set it correctly during creation.
-             // M3U8 parsing usually happens sequentially so I should know the number when creating if I tracked it.
-             // Python code does it at the end.
-             // "Update segment numbers"
-             // I will replace the segment in the list with the updated Num.
              var s = _m3u8.Segments[i];
              _m3u8.Segments[i] = s with { Num = mediaSequence + i };
         }
@@ -100,35 +135,33 @@ public class M3U8Parser
 
     private void AddMediaToPlaylist(HlsPlaylist playlist, string groupId, string type)
     {
-         var medias = _m3u8.Media.Where(m => m.GroupId == groupId).ToList(); // Type check? Python filters by group_id only.
-         // Python: for media in filter(lambda m: m.group_id == group_id, self.m3u8.media): playlist.media.append(media)
-         // Note: Python didn't filter by TYPE here inside the loop explicitly in the snippet I saw,
-         // but `getattr(playlist.stream_info, media_type, None)` implies we look for the group ID corresponding to that type.
-         // And `m.group_id` matching is enough.
-
+         var medias = _m3u8.Media.Where(m => m.GroupId == groupId).ToList();
          playlist.Media.AddRange(medias);
     }
 
+    private void ParseLineString(string line) => ParseLine(line.AsSpan().Trim());
+
     private void ParseLine(ReadOnlySpan<char> line)
     {
+        if (line.IsEmpty) return;
+
         if (line.StartsWith("#"))
         {
             SplitTag(line, out var tag, out var value);
-            if (tag.IsEmpty) return;
+            if (tag.IsEmpty)
+            {
+                // Must be #EXTM3U or comment
+                if (line.SequenceEqual("#EXTM3U")) return;
+                return;
+            }
 
-            // Dispatch based on tag
-            // Using switch on string (Span -> string) or hash
-            // For high perf, maybe manual check or interned strings?
-            // .NET optimizes switch on strings.
-            string tagStr = tag.ToString(); // alloc
-            string valStr = value.ToString(); // alloc - TODO: Optimize to avoid alloc if possible, but parsing attributes usually needs strings.
+            string tagStr = tag.ToString();
+            string valStr = value.ToString();
 
             switch (tagStr)
             {
-                // Basic
                 case "EXT-X-VERSION": _m3u8.Version = int.Parse(valStr); break;
 
-                // Media Segment
                 case "EXTINF": ParseExtInf(valStr); break;
                 case "EXT-X-BYTERANGE":
                     _expectSegment = true;
@@ -140,10 +173,9 @@ public class M3U8Parser
                     break;
                 case "EXT-X-KEY": ParseKey(valStr); break;
                 case "EXT-X-MAP": ParseMap(valStr); break;
-                case "EXT-X-PROGRAM-DATE-TIME": _date = DateTimeOffset.Parse(valStr); break; // ISO8601
+                case "EXT-X-PROGRAM-DATE-TIME": _date = DateTimeOffset.Parse(valStr); break;
                 case "EXT-X-DATERANGE": ParseDateRange(valStr); break;
 
-                // Media Playlist
                 case "EXT-X-TARGETDURATION": _m3u8.TargetDuration = double.Parse(valStr, CultureInfo.InvariantCulture); break;
                 case "EXT-X-MEDIA-SEQUENCE": _m3u8.MediaSequence = int.Parse(valStr); break;
                 case "EXT-X-DISCONTINUITY-SEQUENCE": _m3u8.DiscontinuitySequence = int.Parse(valStr); break;
@@ -152,7 +184,6 @@ public class M3U8Parser
                 case "EXT-X-I-FRAMES-ONLY": _m3u8.IframesOnly = true; break;
                 case "EXT-X-ALLOW-CACHE": _m3u8.AllowCache = valStr == "YES"; break;
 
-                // Master Playlist
                 case "EXT-X-MEDIA": ParseMedia(valStr); break;
                 case "EXT-X-STREAM-INF":
                     _expectPlaylist = true;
@@ -178,8 +209,6 @@ public class M3U8Parser
 
     private void SplitTag(ReadOnlySpan<char> line, out ReadOnlySpan<char> tag, out ReadOnlySpan<char> value)
     {
-        // #TAG:VALUE
-        // remove #
         var content = line.Slice(1);
         int idx = content.IndexOf(':');
         if (idx == -1)
@@ -196,35 +225,29 @@ public class M3U8Parser
 
     private Dictionary<string, string> ParseAttributes(string value)
     {
-        // Regex is heavy. Manual parsing.
-        // Key=Value,Key="Value",...
         var result = new Dictionary<string, string>();
         var span = value.AsSpan();
         int i = 0;
         while (i < span.Length)
         {
-            // Skip whitespace
             while (i < span.Length && char.IsWhiteSpace(span[i])) i++;
             if (i >= span.Length) break;
 
-            // Parse Key
             int keyStart = i;
             while (i < span.Length && span[i] != '=') i++;
-            if (i >= span.Length) break; // Invalid?
+            if (i >= span.Length) break;
 
             var key = span.Slice(keyStart, i - keyStart).Trim().ToString();
-            i++; // Skip =
+            i++;
 
-            // Parse Value
             string val;
             if (i < span.Length && span[i] == '"')
             {
-                // Quoted string
                 i++;
                 int valStart = i;
-                while (i < span.Length && span[i] != '"') i++; // Handle escaped quotes? HLS spec says no escaped quotes usually?
+                while (i < span.Length && span[i] != '"') i++;
                 val = span.Slice(valStart, i - valStart).ToString();
-                i++; // Skip closing quote
+                i++;
             }
             else
             {
@@ -235,7 +258,6 @@ public class M3U8Parser
 
             result[key] = val;
 
-            // Skip comma
             while (i < span.Length && (char.IsWhiteSpace(span[i]) || span[i] == ',')) i++;
         }
         return result;
@@ -244,7 +266,6 @@ public class M3U8Parser
     private void ParseExtInf(string value)
     {
         _expectSegment = true;
-        // duration,title
         int idx = value.IndexOf(',');
         if (idx == -1)
         {
@@ -267,7 +288,6 @@ public class M3U8Parser
 
     private ByteRange ParseByteRange(string value)
     {
-        // length[@offset]
         int idx = value.IndexOf('@');
         if (idx == -1)
         {
@@ -316,8 +336,6 @@ public class M3U8Parser
     private void ParseDateRange(string value)
     {
         var attrs = ParseAttributes(value);
-        // ID, CLASS, START-DATE, END-DATE, DURATION, PLANNED-DURATION, END-ON-NEXT
-
         var dr = new DateRange(
             attrs.GetValueOrDefault("ID"),
             attrs.GetValueOrDefault("CLASS"),
@@ -423,14 +441,8 @@ public class M3U8Parser
     private int RoundBandwidth(int bandwidth)
     {
         if (bandwidth == 0) return 0;
-        // bandwidth = round(bandwidth, 1 - int(math.log10(bandwidth)))
-        // In C#:
         int digits = 1 - (int)Math.Log10(bandwidth);
-        // round(number, ndigits)
-        // If ndigits is negative, it rounds to tens, hundreds, etc.
-        // C# Math.Round doesn't support negative decimals for power of 10 rounding directly like Python.
-        // We need to scale.
-        double scale = Math.Pow(10, -digits); // e.g. digits = -3 (round to 1000s) -> scale = 1000
+        double scale = Math.Pow(10, -digits);
         return (int)(Math.Round(bandwidth / scale) * scale);
     }
 
@@ -460,8 +472,8 @@ public class M3U8Parser
         _date = null;
 
         return new HlsSegment(
-            -1, // Num filled later
-            false, // Init?
+            -1,
+            false,
             discontinuity,
             uri,
             extInf.Duration,
@@ -479,8 +491,6 @@ public class M3U8Parser
         if (IsAbsoluteUri(uri)) return uri;
         if (string.IsNullOrEmpty(_baseUri)) return uri;
 
-        // Combine
-        // System.Uri handles this well
         if (Uri.TryCreate(new Uri(_baseUri), uri, out var result))
         {
             return result.ToString();

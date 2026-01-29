@@ -1,3 +1,5 @@
+using System;
+using System.Net;
 using System.Net.Http;
 using System.Collections.Generic;
 
@@ -51,10 +53,29 @@ public class HlsSession : IHlsSession
     public HlsSession(HlsOptions? options = null, HttpClient? httpClient = null)
     {
         Options = options ?? new HlsOptions();
-        HttpClient = httpClient ?? new HttpClient();
 
-        // Apply timeouts to HttpClient if possible, or just used in requests
-        // HttpClient timeout is global.
+        if (httpClient != null)
+        {
+            HttpClient = httpClient;
+        }
+        else
+        {
+            // Custom SocketsHttpHandler for HTTP/3 and tuning
+            var handler = new SocketsHttpHandler
+            {
+                ConnectTimeout = TimeSpan.FromSeconds(10), // Fast failover
+                PooledConnectionLifetime = TimeSpan.FromMinutes(2), // DNS refresh
+                KeepAlivePingDelay = TimeSpan.FromSeconds(30),
+                KeepAlivePingTimeout = TimeSpan.FromSeconds(5)
+            };
+
+            HttpClient = new HttpClient(handler)
+            {
+                DefaultRequestVersion = HttpVersion.Version30,
+                DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrLower
+            };
+        }
+
         HttpClient.Timeout = TimeSpan.FromSeconds(Options.StreamTimeout);
     }
 }
