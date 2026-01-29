@@ -35,16 +35,14 @@ public class M3U8Parser
 
     public M3U8 Parse(string data)
     {
-        // Legacy entry point
         var bytes = Encoding.UTF8.GetBytes(data);
         var pipe = new Pipe();
         pipe.Writer.Write(bytes);
         pipe.Writer.Complete();
-        ParseAsync(pipe.Reader).GetAwaiter().GetResult(); // Sync over Async for legacy compat
+        ParseAsync(pipe.Reader).GetAwaiter().GetResult();
         return _m3u8;
     }
 
-    // New Pipelined Entry Point
     public async Task<M3U8> ParseAsync(PipeReader reader)
     {
         while (true)
@@ -54,19 +52,14 @@ public class M3U8Parser
 
             while (TryReadLine(ref buffer, out ReadOnlySequence<byte> lineSequence))
             {
-                 // Process Line
-                 // We need to decode to chars. UTF8.
-                 // For low alloc, we can use a stack buffer if line is small, or array pool.
-                 // Most M3U8 lines are short (< 1024 chars).
                  if (lineSequence.Length > 4096)
                  {
-                     // Fallback for huge lines? Or just alloc.
                      ParseLineString(Encoding.UTF8.GetString(lineSequence));
                  }
                  else
                  {
                      int len = (int)lineSequence.Length;
-                     char[] chars = ArrayPool<char>.Shared.Rent(len); // Or use stackalloc with Span if not async? We are inside async method.
+                     char[] chars = ArrayPool<char>.Shared.Rent(len);
                      try
                      {
                          int charCount = Encoding.UTF8.GetChars(lineSequence, chars);
@@ -150,7 +143,6 @@ public class M3U8Parser
             SplitTag(line, out var tag, out var value);
             if (tag.IsEmpty)
             {
-                // Must be #EXTM3U or comment
                 if (line.SequenceEqual("#EXTM3U")) return;
                 return;
             }
@@ -183,6 +175,7 @@ public class M3U8Parser
                 case "EXT-X-PLAYLIST-TYPE": _m3u8.PlaylistType = valStr; break;
                 case "EXT-X-I-FRAMES-ONLY": _m3u8.IframesOnly = true; break;
                 case "EXT-X-ALLOW-CACHE": _m3u8.AllowCache = valStr == "YES"; break;
+                case "EXT-X-INDEPENDENT-SEGMENTS": _m3u8.HasIndependentSegments = true; break;
 
                 case "EXT-X-MEDIA": ParseMedia(valStr); break;
                 case "EXT-X-STREAM-INF":
@@ -191,6 +184,9 @@ public class M3U8Parser
                     break;
                 case "EXT-X-I-FRAME-STREAM-INF": ParseIFrameStreamInf(valStr); break;
                 case "EXT-X-START": ParseStart(valStr); break;
+
+                case "EXT-X-SESSION-DATA": ParseSessionData(valStr); break;
+                case "EXT-X-SESSION-KEY": ParseSessionKey(valStr); break;
             }
         }
         else if (_expectSegment)
@@ -301,8 +297,20 @@ public class M3U8Parser
 
     private void ParseKey(string value)
     {
+        var key = CreateKey(value);
+        if (key != null) _key = key;
+    }
+
+    private void ParseSessionKey(string value)
+    {
+        var key = CreateKey(value);
+        if (key != null) _m3u8.SessionKeys.Add(key);
+    }
+
+    private Key? CreateKey(string value)
+    {
         var attrs = ParseAttributes(value);
-        if (!attrs.TryGetValue("METHOD", out var method)) return;
+        if (!attrs.TryGetValue("METHOD", out var method)) return null;
 
         string? uri = attrs.GetValueOrDefault("URI");
         string? ivStr = attrs.GetValueOrDefault("IV");
@@ -315,7 +323,22 @@ public class M3U8Parser
             }
         }
 
-        _key = new Key(method, ResolveUri(uri), iv, attrs.GetValueOrDefault("KEYFORMAT"), attrs.GetValueOrDefault("KEYFORMATVERSIONS"));
+        return new Key(method, ResolveUri(uri), iv, attrs.GetValueOrDefault("KEYFORMAT"), attrs.GetValueOrDefault("KEYFORMATVERSIONS"));
+    }
+
+    private void ParseSessionData(string value)
+    {
+        var attrs = ParseAttributes(value);
+        string? dataId = attrs.GetValueOrDefault("DATA-ID");
+        if (dataId == null) return;
+
+        var sd = new SessionData(
+            dataId,
+            attrs.GetValueOrDefault("VALUE"),
+            ResolveUri(attrs.GetValueOrDefault("URI")),
+            attrs.GetValueOrDefault("LANGUAGE")
+        );
+        _m3u8.SessionData.Add(sd);
     }
 
     private void ParseMap(string value)

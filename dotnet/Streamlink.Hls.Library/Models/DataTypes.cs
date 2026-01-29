@@ -69,11 +69,6 @@ public partial record IFrameStreamInfo(
     string? Video
 );
 
-// Discriminated union or just base class for StreamInfo?
-// In Python it's a Union. In C# we can use a wrapper or just use object.
-// Or we can have a common base/interface if they share fields.
-// Bandwidth, ProgramId, Codecs, Resolution, Video are shared.
-
 public interface IStreamInfo
 {
     int Bandwidth { get; }
@@ -114,6 +109,13 @@ public record HlsSegment(
     Map? Map
 ) : Segment(Num, Init, Discontinuity, Uri, Duration);
 
+public record SessionData(
+    string DataId,
+    string? Value,
+    string? Uri,
+    string? Language
+);
+
 public class M3U8
 {
     public string? Uri { get; set; }
@@ -127,11 +129,15 @@ public class M3U8
     public double? TargetDuration { get; set; }
     public Start? Start { get; set; }
     public int? Version { get; set; }
+    public bool HasIndependentSegments { get; set; }
 
     public List<Media> Media { get; } = new();
     public List<DateRange> DateRanges { get; } = new();
     public List<HlsPlaylist> Playlists { get; } = new();
     public List<HlsSegment> Segments { get; } = new();
+
+    public List<SessionData> SessionData { get; } = new();
+    public List<Key> SessionKeys { get; } = new();
 
     public M3U8(string? uri = null)
     {
