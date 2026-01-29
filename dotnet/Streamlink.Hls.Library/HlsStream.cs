@@ -1,113 +1,101 @@
+using System;
 using System.IO;
-using System.IO.Pipelines;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Streamlink.Hls.Library.Models;
 
 namespace Streamlink.Hls.Library;
 
-public class HlsStream
+public class HlsStream : IDisposable
 {
     private readonly IHlsSession _session;
     private readonly string _url;
+    private readonly ILogger<HlsStream> _logger;
+    private readonly ILoggerFactory _loggerFactory;
 
-    public HlsStream(IHlsSession session, string url)
+    private Channel<HlsSegment>? _segmentChannel;
+    private HlsStreamBroadcaster? _broadcaster;
+    private HlsStreamWorker? _worker;
+    private HlsStreamWriter? _writer;
+    private CancellationTokenSource? _lifecycleCts;
+    private Task? _workerTask;
+    private Task? _writerTask;
+    private bool _started;
+    private readonly object _lock = new();
+
+    public HlsStream(IHlsSession session, string url, ILoggerFactory? loggerFactory = null)
     {
         _session = session;
         _url = url;
+        _loggerFactory = loggerFactory ?? NullLoggerFactory.Instance;
+        _logger = _loggerFactory.CreateLogger<HlsStream>();
     }
 
     public async Task<Stream> OpenAsync(CancellationToken cancellationToken = default)
     {
-        // 1. Setup channels and buffer
-        var segmentChannel = Channel.CreateBounded<HlsSegment>(new BoundedChannelOptions(100)
+        lock (_lock)
+        {
+            if (!_started)
+            {
+                StartProcessing();
+                _started = true;
+            }
+        }
+
+        // Subscribe to broadcaster
+        return _broadcaster!.Subscribe(cancellationToken);
+    }
+
+    private void StartProcessing()
+    {
+        _lifecycleCts = new CancellationTokenSource();
+
+        _segmentChannel = Channel.CreateBounded<HlsSegment>(new BoundedChannelOptions(100)
         {
             SingleReader = true,
             SingleWriter = true,
             FullMode = BoundedChannelFullMode.Wait
         });
 
-        var buffer = new StreamBuffer();
+        _broadcaster = new HlsStreamBroadcaster();
 
-        // 2. Create Worker and Writer
-        var worker = new HlsStreamWorker(_session, _url);
-        var writer = new HlsStreamWriter(_session, segmentChannel, buffer);
+        _worker = new HlsStreamWorker(_session, _url, _loggerFactory.CreateLogger<HlsStreamWorker>());
+        _writer = new HlsStreamWriter(_session, _segmentChannel, _broadcaster, _loggerFactory.CreateLogger<HlsStreamWriter>());
 
-        // 3. Start background tasks
-        // We need a CancellationTokenSource linked to the stream lifetime
-        var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var token = _lifecycleCts.Token;
 
-        // Fire and forget tasks (monitored via completion)
-        _ = Task.Run(async () =>
+        _workerTask = Task.Run(async () =>
         {
             try
             {
-                await worker.RunAsync(segmentChannel.Writer, cts.Token);
+                await _worker.RunAsync(_segmentChannel.Writer, token);
             }
             catch (Exception ex)
             {
-                // If worker fails, we should probably fail the writer -> buffer
-                // The writer will complete when channel completes.
-                // But if worker crashes with exception, channel completes with exception?
-                segmentChannel.Writer.Complete(ex);
+                _segmentChannel.Writer.Complete(ex);
             }
-        }, cts.Token);
+        }, token);
 
-        _ = Task.Run(async () =>
+        _writerTask = Task.Run(async () =>
         {
              try
              {
-                 await writer.RunAsync(cts.Token);
+                 await _writer.RunAsync(token);
              }
              catch (Exception ex)
              {
-                 buffer.CompleteWriter(ex);
+                 _broadcaster.Complete(ex);
              }
-        }, cts.Token);
-
-        // 4. Return stream
-        // When the stream is disposed, we should cancel the CTS.
-        var stream = buffer.Reader.AsStream(true); // leaveOpen=true because we handle disposal? No, AsStream returns a wrapper.
-        // We need to wrap this stream to cancel CTS on Dispose.
-
-        return new HlsReadOnlyStream(stream, cts);
+        }, token);
     }
 
-    private class HlsReadOnlyStream : Stream
+    public void Dispose()
     {
-        private readonly Stream _inner;
-        private readonly CancellationTokenSource _cts;
-
-        public HlsReadOnlyStream(Stream inner, CancellationTokenSource cts)
-        {
-            _inner = inner;
-            _cts = cts;
-        }
-
-        public override bool CanRead => _inner.CanRead;
-        public override bool CanSeek => _inner.CanSeek;
-        public override bool CanWrite => false;
-        public override long Length => _inner.Length;
-        public override long Position { get => _inner.Position; set => _inner.Position = value; }
-
-        public override void Flush() => _inner.Flush();
-        public override int Read(byte[] buffer, int offset, int count) => _inner.Read(buffer, offset, count);
-        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) => _inner.ReadAsync(buffer, offset, count, cancellationToken);
-        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) => _inner.ReadAsync(buffer, cancellationToken);
-        public override long Seek(long offset, SeekOrigin origin) => _inner.Seek(offset, origin);
-        public override void SetLength(long value) => _inner.SetLength(value);
-        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
-
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-            {
-                _cts.Cancel();
-                _cts.Dispose();
-                _inner.Dispose();
-            }
-            base.Dispose(disposing);
-        }
+        _lifecycleCts?.Cancel();
+        _lifecycleCts?.Dispose();
+        _broadcaster?.Dispose();
     }
 }

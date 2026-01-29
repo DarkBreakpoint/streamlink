@@ -20,17 +20,17 @@ public class HlsStreamWriter
 {
     private readonly IHlsSession _session;
     private readonly Channel<HlsSegment> _inputChannel;
-    private readonly StreamBuffer _outputBuffer;
+    private readonly HlsStreamBroadcaster _outputBroadcaster; // Replaced StreamBuffer
     private readonly ConcurrentDictionary<string, Task<byte[]>> _keyCache = new();
     private readonly HttpClient _httpClient;
     private readonly ResiliencePipeline _resiliencePipeline;
     private readonly ILogger<HlsStreamWriter> _logger;
 
-    public HlsStreamWriter(IHlsSession session, Channel<HlsSegment> inputChannel, StreamBuffer outputBuffer, ILogger<HlsStreamWriter>? logger = null)
+    public HlsStreamWriter(IHlsSession session, Channel<HlsSegment> inputChannel, HlsStreamBroadcaster outputBroadcaster, ILogger<HlsStreamWriter>? logger = null)
     {
         _session = session;
         _inputChannel = inputChannel;
-        _outputBuffer = outputBuffer;
+        _outputBroadcaster = outputBroadcaster;
         _httpClient = session.HttpClient;
         _logger = logger ?? NullLogger<HlsStreamWriter>.Instance;
 
@@ -107,26 +107,31 @@ public class HlsStreamWriter
     {
         try
         {
-            using var outputStream = _outputBuffer.Writer.AsStream(true);
+            byte[] buffer = new byte[8192];
 
             await foreach (var task in reader.ReadAllAsync(ct))
             {
                 using var stream = await task;
                 if (stream != null)
                 {
-                    await stream.CopyToAsync(outputStream, ct);
-                    await _outputBuffer.Writer.FlushAsync(ct);
+                    int read;
+                    while ((read = await stream.ReadAsync(buffer, ct)) > 0)
+                    {
+                        // Copy data to broadcast hub
+                        // Need to create a copy because buffer is reused
+                        await _outputBroadcaster.WriteAsync(new ReadOnlyMemory<byte>(buffer.AsSpan(0, read).ToArray()), ct);
+                    }
                 }
             }
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            _outputBuffer.CompleteWriter(ex);
+            _outputBroadcaster.Complete(ex);
             return;
         }
 
-        _outputBuffer.CompleteWriter();
+        _outputBroadcaster.Complete();
     }
 
     private async ValueTask<Stream?> DownloadMapAsync(Map map, HlsSegment context, CancellationToken ct)
@@ -173,8 +178,6 @@ public class HlsStreamWriter
     {
         if (_session.Options.SegmentIgnoreNames.Count > 0)
         {
-             // Use Regex?
-             // We will implement regex support next.
              foreach (var ignore in _session.Options.SegmentIgnoreNames)
              {
                  if (segment.Uri.Contains(ignore)) return true;
@@ -228,7 +231,6 @@ public class HlsStreamWriter
 
         var networkStream = await response.Content.ReadAsStreamAsync(ct);
 
-        // Use configured StreamStallTimeout
         var stallStream = new StallDetectingStream(networkStream, TimeSpan.FromSeconds(_session.Options.StreamStallTimeout));
 
         Stream resultStream = stallStream;
